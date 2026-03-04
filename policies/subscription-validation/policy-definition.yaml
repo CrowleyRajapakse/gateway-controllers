@@ -1,0 +1,30 @@
+name: subscription-validation
+version: v0.1.0
+description: |
+  Validates that the request has an active subscription to the
+  requested API. Checks the Subscription-Key header first; falls
+  back to application_id from request metadata (set by auth policy).
+  If the subscription plan has throttle limits, enforces rate limiting
+  keyed by the subscription token.
+
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    enabled:
+      type: boolean
+      default: true
+      description: >
+        When false, the subscription validation check is disabled and the
+        policy is effectively a no-op.
+    subscriptionKeyHeader:
+      type: string
+      default: Subscription-Key
+      description: >
+        Request header name containing the subscription token.
+        Checked before falling back to applicationId from metadata.
+
+systemParameters:
+  type: object
+  additionalProperties: false
+  properties: {}
