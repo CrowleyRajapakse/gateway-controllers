@@ -100,6 +100,7 @@ skipTlsVerify = false
 | `requiredClaims` | object | No | Map of claim name to expected value. |
 | `claimMappings` | object | No | Map of claim name to downstream header name. |
 | `authHeaderPrefix` | string | No | Overrides the configured authorization header scheme for this route. |
+| `headerName` | string | No | Header name to extract the token from (e.g., `"Authorization"`). Overrides `system.headerName`. Must be a valid HTTP header field name (non-empty, no spaces or control characters). |
 | `userIdClaim` | string | No | Claim name to extract user ID for analytics. Defaults to `sub`. |
 
 
@@ -199,7 +200,33 @@ spec:
               role: X-User-Role
 ```
 
-### Example 4: Custom User ID Claim for Analytics
+### Example 4: Custom Token Header
+
+```yaml
+apiVersion: gateway.api-platform.wso2.com/v1alpha1
+kind: RestApi
+metadata:
+  name: jwt-auth-custom-header-api
+spec:
+  displayName: JWT Auth Custom Header API
+  version: v1.0
+  context: /jwt-auth-custom/$version
+  upstream:
+    main:
+      url: http://sample-backend:9080/api/v1
+  operations:
+    - method: GET
+      path: /protected
+      policies:
+        - name: jwt-auth
+          version: v0
+          params:
+            issuers:
+              - PrimaryIDP
+            headerName: X-API-Token
+```
+
+### Example 5: Custom User ID Claim for Analytics
 
 ```yaml
 apiVersion: gateway.api-platform.wso2.com/v1alpha1
