@@ -20,7 +20,7 @@ The policy uses embedding models (OpenAI, Mistral, or Azure OpenAI) to convert p
 
 ## Configuration
 
-The Semantic Prompt Guardrail policy uses a two-level configuration
+The Semantic Prompt Guardrail policy uses a two-level configuration.
 
 ### System Parameters (From config.toml)
 
