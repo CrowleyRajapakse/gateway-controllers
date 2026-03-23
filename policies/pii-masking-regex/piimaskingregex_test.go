@@ -56,13 +56,13 @@ func TestPIIMaskingRegexPolicy_GetPolicy_ParseErrors(t *testing.T) {
 			wantErrContain: "'customPIIEntities[0]' must be an object",
 		},
 		{
-			name: "custom piiEntity invalid",
+			name: "custom piiEntity invalid characters",
 			params: map[string]interface{}{
 				"customPIIEntities": []interface{}{
-					map[string]interface{}{"piiEntity": "email", "piiRegex": "a+"},
+					map[string]interface{}{"piiEntity": "email-1", "piiRegex": "a+"},
 				},
 			},
-			wantErrContain: "'customPIIEntities[0].piiEntity' must match ^[A-Z_]+$",
+			wantErrContain: "'customPIIEntities[0].piiEntity' must contain only letters and underscores",
 		},
 		{
 			name: "custom piiRegex invalid",
@@ -87,7 +87,7 @@ func TestPIIMaskingRegexPolicy_GetPolicy_ParseErrors(t *testing.T) {
 			name: "duplicate builtin and custom",
 			params: map[string]interface{}{
 				"customPIIEntities": []interface{}{
-					map[string]interface{}{"piiEntity": "EMAIL", "piiRegex": "a+"},
+					map[string]interface{}{"piiEntity": "email", "piiRegex": "a+"},
 				},
 				"email": true,
 			},
@@ -164,6 +164,18 @@ func TestPIIMaskingRegexPolicy_GetPolicy_CustomJSONString(t *testing.T) {
 	}
 	if _, ok := p.params.PIIEntities["ORDER_ID"]; !ok {
 		t.Fatalf("expected ORDER_ID custom detector")
+	}
+}
+
+func TestPIIMaskingRegexPolicy_GetPolicy_CustomEntityName_IsNormalizedToUppercase(t *testing.T) {
+	p := mustGetPIIPolicy(t, map[string]interface{}{
+		"customPIIEntities": []interface{}{
+			map[string]interface{}{"piiEntity": "order_id", "piiRegex": "ORD-[0-9]+"},
+		},
+	})
+
+	if _, ok := p.params.PIIEntities["ORDER_ID"]; !ok {
+		t.Fatalf("expected lowercase custom entity name to be normalized to ORDER_ID")
 	}
 }
 

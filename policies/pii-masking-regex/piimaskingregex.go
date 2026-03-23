@@ -103,12 +103,13 @@ func parseParams(params map[string]interface{}) (PIIMaskingRegexPolicyParams, er
 		// Validate each custom PII entity.
 		for i, entityConfig := range piiEntitiesArray {
 			piiEntity, ok := entityConfig["piiEntity"].(string)
-			if !ok || piiEntity == "" {
+			if !ok || strings.TrimSpace(piiEntity) == "" {
 				return result, fmt.Errorf("'customPIIEntities[%d].piiEntity' is required and must be a non-empty string", i)
 			}
 
-			if !regexp.MustCompile(`^[A-Z_]+$`).MatchString(piiEntity) {
-				return result, fmt.Errorf("'customPIIEntities[%d].piiEntity' must match ^[A-Z_]+$", i)
+			normalizedPIIEntity := strings.ToUpper(strings.TrimSpace(piiEntity))
+			if !regexp.MustCompile(`^[A-Z_]+$`).MatchString(normalizedPIIEntity) {
+				return result, fmt.Errorf("'customPIIEntities[%d].piiEntity' must contain only letters and underscores", i)
 			}
 
 			piiRegex, ok := entityConfig["piiRegex"].(string)
@@ -121,10 +122,10 @@ func parseParams(params map[string]interface{}) (PIIMaskingRegexPolicyParams, er
 				return result, fmt.Errorf("'customPIIEntities[%d].piiRegex' is invalid: %w", i, err)
 			}
 
-			if _, exists := piiEntities[piiEntity]; exists {
-				return result, fmt.Errorf("duplicate piiEntity: %q", piiEntity)
+			if _, exists := piiEntities[normalizedPIIEntity]; exists {
+				return result, fmt.Errorf("duplicate piiEntity: %q", normalizedPIIEntity)
 			}
-			piiEntities[piiEntity] = compiledPattern
+			piiEntities[normalizedPIIEntity] = compiledPattern
 		}
 	}
 
