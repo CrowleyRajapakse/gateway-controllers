@@ -18,7 +18,7 @@ package llmcost
 
 import "encoding/json"
 
-// OpenAICalculator handles models with provider "openai" and "text-completion-openai".
+// OpenAICalculator handles models with provider "openai".
 type OpenAICalculator struct{}
 
 func (c *OpenAICalculator) Normalize(responseBody []byte, requestBody []byte) (Usage, error) {
