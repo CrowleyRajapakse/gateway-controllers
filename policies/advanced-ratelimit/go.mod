@@ -1,6 +1,6 @@
 module github.com/wso2/gateway-controllers/policies/advanced-ratelimit
 
-go 1.25.1
+go 1.25.7
 
 require (
 	github.com/google/cel-go v0.26.1

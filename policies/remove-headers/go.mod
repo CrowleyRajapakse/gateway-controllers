@@ -1,6 +1,6 @@
 module github.com/wso2/gateway-controllers/policies/remove-headers
 
-go 1.25.1
+go 1.25.7
 
 require github.com/wso2/api-platform/sdk v0.4.5
 

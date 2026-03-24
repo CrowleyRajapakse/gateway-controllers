@@ -449,6 +449,10 @@ func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx *policyv1alpha2.ResponseS
 		return policyv1alpha2.ResponseChunkAction{}
 	}
 
+	if ctx.Metadata == nil {
+		ctx.Metadata = make(map[string]interface{})
+	}
+
 	chunkStr := string(chunk.Chunk)
 	if !isSSEChunk(chunkStr) {
 		// Plain JSON via chunked transfer (e.g. OpenAI stream:false with Transfer-Encoding: chunked).

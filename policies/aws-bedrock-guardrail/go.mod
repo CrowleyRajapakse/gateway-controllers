@@ -1,6 +1,6 @@
 module github.com/wso2/gateway-controllers/policies/aws-bedrock-guardrail
 
-go 1.25.1
+go 1.25.7
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.31.0

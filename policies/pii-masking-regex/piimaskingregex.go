@@ -552,9 +552,13 @@ func (p *PIIMaskingRegexPolicy) processResponseBody(ctx *policyv1alpha2.Response
 
 	bodyStr := string(ctx.ResponseBody.Content)
 
+	// maskedPIIMap is keyed original→placeholder (set by maskPIIFromContent).
+	// The restore helpers expect placeholder→original, so invert before use.
+	restoreMap := invertStringMap(maskedPIIMap)
+
 	if isSSEChunk(bodyStr) {
 		// SSE-buffered: reuse the streaming restoration logic.
-		action := p.restoreSSEChunk(bodyStr, maskedPIIMap)
+		action := p.restoreSSEChunk(bodyStr, restoreMap)
 		if action.Body == nil {
 			return policyv1alpha2.DownstreamResponseModifications{}
 		}
@@ -563,13 +567,13 @@ func (p *PIIMaskingRegexPolicy) processResponseBody(ctx *policyv1alpha2.Response
 
 	// Plain JSON buffered response: try OpenAI choices[*].message.content first,
 	// then fall back to raw placeholder replacement for generic JSON structures.
-	updatedJSON, changed := restoreInChoices(bodyStr, maskedPIIMap, "message")
+	updatedJSON, changed := restoreInChoices(bodyStr, restoreMap, "message")
 	if changed {
 		return policyv1alpha2.DownstreamResponseModifications{Body: []byte(updatedJSON)}
 	}
 
 	// Fallback: restore placeholders directly in the raw JSON bytes.
-	action := p.restoreJSONChunk(bodyStr, maskedPIIMap)
+	action := p.restoreJSONChunk(bodyStr, restoreMap)
 	if action.Body != nil {
 		return policyv1alpha2.DownstreamResponseModifications{Body: action.Body}
 	}
@@ -600,12 +604,16 @@ func (p *PIIMaskingRegexPolicy) NeedsMoreResponseData(accumulated []byte) bool {
 	// which data-line index contained the last '[' for the 5-token cap.
 	content, openBracketDataLineIdx, totalDataLines := extractSSEDeltaContentTracked(s)
 	if content == "" {
-		return false
+		// No complete data: lines yet — keep buffering only if a partial line is still
+		// being received; otherwise the accumulator genuinely has no content.
+		return hasTrailingPartialDataLine(s)
 	}
 
 	lastOpen := strings.LastIndex(content, "[")
 	if lastOpen == -1 {
-		return false
+		// No '[' in the parsed content yet — keep buffering if a partial data: line
+		// could be carrying a placeholder that hasn't been delivered in full.
+		return hasTrailingPartialDataLine(s)
 	}
 
 	afterBracket := content[lastOpen+1:]
@@ -653,12 +661,16 @@ func (p *PIIMaskingRegexPolicy) OnResponseBodyChunk(ctx *policyv1alpha2.Response
 
 	chunkStr := string(chunk.Chunk)
 
+	// maskedPIIMap is keyed original→placeholder (set by maskPIIFromContent).
+	// The restore helpers expect placeholder→original, so invert before use.
+	restoreMap := invertStringMap(maskedPIIMap)
+
 	// Detect format: SSE responses have lines starting with "data: "
 	if isSSEChunk(chunkStr) {
-		v1result := p.restoreSSEChunk(chunkStr, maskedPIIMap)
+		v1result := p.restoreSSEChunk(chunkStr, restoreMap)
 		return policyv1alpha2.ResponseChunkAction{Body: v1result.Body}
 	}
-	v1result := p.restoreJSONChunk(chunkStr, maskedPIIMap)
+	v1result := p.restoreJSONChunk(chunkStr, restoreMap)
 	return policyv1alpha2.ResponseChunkAction{Body: v1result.Body}
 }
 
@@ -891,6 +903,27 @@ func restoreInChoices(jsonStr string, maskedMap map[string]string, choiceKey str
 	return string(updatedBytes), true
 }
 
+// hasTrailingPartialDataLine reports whether the last "data: " line in s is an
+// incomplete (unparseable) SSE event, meaning the JSON payload has not been
+// fully delivered yet. extractSSEDeltaContentTracked silently skips such lines,
+// so callers use this to detect that more data is still needed.
+func hasTrailingPartialDataLine(s string) bool {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimRight(lines[i], "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			return false
+		}
+		var data map[string]interface{}
+		return json.Unmarshal([]byte(jsonStr), &data) != nil
+	}
+	return false
+}
+
 // extractSSEDeltaContentTracked concatenates choices[*].delta.content from all
 // complete SSE data lines in the accumulated buffer. It returns:
 //   - the concatenated content string
@@ -963,6 +996,15 @@ func isPartialPlaceholder(afterBracket string) bool {
 		return true // still building entity name, no underscore yet
 	}
 	return len(afterBracket)-lastUnderscore-1 <= 4 // true = counter incomplete or ']' not yet seen
+}
+
+// invertStringMap returns a new map with keys and values swapped.
+func invertStringMap(m map[string]string) map[string]string {
+	inv := make(map[string]string, len(m))
+	for k, v := range m {
+		inv[v] = k
+	}
+	return inv
 }
 
 // restore replaces placeholders with their original values.

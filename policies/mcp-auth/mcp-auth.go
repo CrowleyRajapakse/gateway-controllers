@@ -27,7 +27,6 @@ import (
 
 	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
-	policyv1alpha "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	jwtauth "github.com/wso2/gateway-controllers/policies/jwt-auth"
 )
 
@@ -423,6 +422,20 @@ func buildInvalidConfigResponse(message string) policy.RequestAction {
 	}
 }
 
+func buildInvalidConfigResponseV2(message string) policyv1alpha2.RequestAction {
+	body, _ := json.Marshal(map[string]string{
+		"error":   "Internal Server Error",
+		"message": message,
+	})
+	return policyv1alpha2.ImmediateResponse{
+		StatusCode: 500,
+		Headers: map[string]string{
+			"content-type": "application/json",
+		},
+		Body: body,
+	}
+}
+
 func ensureRequestMetadata(ctx *policy.RequestContext) {
 	if ctx.SharedContext == nil {
 		ctx.SharedContext = &policy.SharedContext{}
@@ -439,14 +452,14 @@ func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContex
 	errorMessageFormat := getStringParam(params, "errorMessageFormat", "json")
 	userRequiredScopes := getStringArrayParam(params, "requiredScopes", []string{})
 	if err := validateAuthFailureConfig(onFailureStatusCode, errorMessageFormat); err != nil {
-		v1r := buildInvalidConfigResponse(err.Error()).(policyv1alpha.ImmediateResponse)
+		v1r := buildInvalidConfigResponseV2(err.Error()).(policyv1alpha2.ImmediateResponse)
 		return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
 	}
 
 	gatewayHost := getStringParam(params, "gatewayHost", "")
 	if gatewayHost != "" {
 		if ctx.Metadata == nil {
-			ctx.SharedContext.Metadata = map[string]any{}
+			ctx.Metadata = map[string]any{}
 		}
 		ctx.Metadata["gatewayHost"] = gatewayHost
 	}
@@ -466,7 +479,7 @@ func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContex
 
 		issuers, kms, err := parseKeyManagers(keyManagersRaw)
 		if err != nil {
-			v1r := buildInvalidConfigResponse(err.Error()).(policyv1alpha.ImmediateResponse)
+			v1r := buildInvalidConfigResponseV2(err.Error()).(policyv1alpha2.ImmediateResponse)
 			return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
 		}
 		if len(issuers) == 0 {
@@ -517,10 +530,14 @@ func (p *McpAuthPolicy) handleAuthHeaders(ctx *policyv1alpha2.RequestHeaderConte
 		sessionId = sessionIds[0]
 	}
 
-	jwtPolicy, _ := jwtauth.GetPolicy(policyv1alpha.PolicyMetadata{}, params)
+	// jwtPolicy, err := jwtauth.GetPolicyV2(policyv1alpha2.PolicyMetadata{}, params)
+	jwtPolicy, err := jwtauth.GetPolicy(policy.PolicyMetadata{}, params)
+	if err != nil {
+		return p.handleAuthFailureHeaders(ctx.SharedContext, 500, "json", fmt.Sprintf("jwtauth.GetPolicy unavailable: %s", err))
+	}
 	hrp, ok := jwtPolicy.(requestHeaderPolicer)
 	if !ok {
-		return policyv1alpha2.UpstreamRequestHeaderModifications{}
+		return p.handleAuthFailureHeaders(ctx.SharedContext, 500, "json", "jwtPolicy does not implement OnRequestHeaders (requestHeaderPolicer)")
 	}
 
 	headerAction := hrp.OnRequestHeaders(ctx, params)
