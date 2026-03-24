@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	utils "github.com/wso2/api-platform/sdk/utils"
 )
@@ -36,6 +37,12 @@ const (
 	DefaultResponseJSONPath      = "$.choices[0].message.content"
 	RequestFlowEnabledByDefault  = true
 	ResponseFlowEnabledByDefault = false
+
+	sseDataPrefix               = "data: "
+	sseDone                     = "[DONE]"
+	metaKeyResponseRunningBytes = "contentlengthguardrail:response_bytes"
+	metaKeyAccJsonBody          = "contentlengthguardrail:json_body"
+	DefaultStreamingJsonPath    = "$.choices[*].delta.content"
 )
 
 var textCleanRegexCompiled = regexp.MustCompile(TextCleanRegex)
@@ -49,12 +56,13 @@ type ContentLengthGuardrailPolicy struct {
 }
 
 type ContentLengthGuardrailPolicyParams struct {
-	Enabled        bool
-	Min            int
-	Max            int
-	JsonPath       string
-	Invert         bool
-	ShowAssessment bool
+	Enabled           bool
+	Min               int
+	Max               int
+	JsonPath          string
+	StreamingJsonPath string
+	Invert            bool
+	ShowAssessment    bool
 }
 
 func GetPolicy(
@@ -96,8 +104,9 @@ func GetPolicy(
 // parseParams parses and validates parameters from map to struct
 func parseParams(params map[string]interface{}, isResponse bool) (ContentLengthGuardrailPolicyParams, error) {
 	result := ContentLengthGuardrailPolicyParams{
-		JsonPath: DefaultJSONPath,
-		Enabled:  RequestFlowEnabledByDefault,
+		JsonPath:          DefaultJSONPath,
+		StreamingJsonPath: DefaultStreamingJsonPath,
+		Enabled:           RequestFlowEnabledByDefault,
 	}
 	enabledExplicitlyFalse := false
 	if isResponse {
@@ -159,6 +168,15 @@ func parseParams(params map[string]interface{}, isResponse bool) (ContentLengthG
 			result.JsonPath = jsonPath
 		} else {
 			return result, fmt.Errorf("'jsonPath' must be a string")
+		}
+	}
+
+	// Extract optional streamingJsonPath parameter
+	if streamingJsonPathRaw, ok := params["streamingJsonPath"]; ok {
+		if streamingJsonPath, ok := streamingJsonPathRaw.(string); ok {
+			result.StreamingJsonPath = streamingJsonPath
+		} else {
+			return result, fmt.Errorf("'streamingJsonPath' must be a string")
 		}
 	}
 
@@ -357,4 +375,370 @@ func (p *ContentLengthGuardrailPolicy) buildAssessmentObject(reason string, vali
 	}
 
 	return assessment
+}
+
+// OnRequestBody validates request body content length.
+func (p *ContentLengthGuardrailPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, _ map[string]interface{}) policyv1alpha2.RequestAction {
+	if !p.hasRequestParams || !p.requestParams.Enabled {
+		return policyv1alpha2.UpstreamRequestModifications{}
+	}
+
+	var content []byte
+	if ctx.Body != nil {
+		content = ctx.Body.Content
+	}
+	return p.validatePayloadV2(content, p.requestParams, false).(policyv1alpha2.RequestAction)
+}
+
+// OnResponseBody validates response body content length.
+func (p *ContentLengthGuardrailPolicy) OnResponseBody(ctx *policyv1alpha2.ResponseContext, _ map[string]interface{}) policyv1alpha2.ResponseAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	content := []byte{}
+	if ctx.ResponseBody != nil {
+		content = ctx.ResponseBody.Content
+	}
+	return p.validatePayloadV2(content, p.responseParams, true).(policyv1alpha2.ResponseAction)
+}
+
+// validatePayloadV2 validates payload content length, returning policyv1alpha2 actions.
+func (p *ContentLengthGuardrailPolicy) validatePayloadV2(payload []byte, params ContentLengthGuardrailPolicyParams, isResponse bool) interface{} {
+	extractedValue, err := utils.ExtractStringValueFromJsonpath(payload, params.JsonPath)
+	if err != nil {
+		slog.Debug("ContentLengthGuardrail: Error extracting value from JSONPath", "jsonPath", params.JsonPath, "error", err, "isResponse", isResponse)
+		return p.buildErrorResponseV2("Error extracting value from JSONPath", err, isResponse, params.ShowAssessment, params.Min, params.Max)
+	}
+
+	extractedValue = textCleanRegexCompiled.ReplaceAllString(extractedValue, "")
+	extractedValue = strings.TrimSpace(extractedValue)
+
+	byteCount := len([]byte(extractedValue))
+
+	isWithinRange := byteCount >= params.Min && byteCount <= params.Max
+
+	var validationPassed bool
+	if params.Invert {
+		validationPassed = !isWithinRange
+	} else {
+		validationPassed = isWithinRange
+	}
+
+	if !validationPassed {
+		slog.Debug("ContentLengthGuardrail: Validation failed", "byteCount", byteCount, "min", params.Min, "max", params.Max, "invert", params.Invert, "isResponse", isResponse)
+		var reason string
+		if params.Invert {
+			reason = fmt.Sprintf("content length %d bytes is within the excluded range %d-%d bytes", byteCount, params.Min, params.Max)
+		} else {
+			reason = fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", byteCount, params.Min, params.Max)
+		}
+		return p.buildErrorResponseV2(reason, nil, isResponse, params.ShowAssessment, params.Min, params.Max)
+	}
+
+	slog.Debug("ContentLengthGuardrail: Validation passed", "byteCount", byteCount, "min", params.Min, "max", params.Max, "isResponse", isResponse)
+	if isResponse {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+	return policyv1alpha2.UpstreamRequestModifications{}
+}
+
+// ─── Streaming (SSE) support ──────────────────────────────────────────────────
+//
+// NeedsMoreResponseData and OnResponseBodyChunk together implement
+// StreamingResponsePolicy for SSE (stream: true) responses.
+//
+// max enforcement (early termination):
+//   NeedsMoreResponseData returns false immediately (no min gate), so each SSE
+//   chunk is forwarded to OnResponseBodyChunk straight away. OnResponseBodyChunk
+//   maintains a running byte count in ctx.Metadata and injects an SSE error
+//   event as soon as the cumulative delta.content byte count exceeds max.
+//
+// min enforcement (gate-then-stream):
+//   When min is configured, NeedsMoreResponseData buffers silently until the
+//   accumulated delta.content byte count reaches min, then flushes. From that
+//   point OnResponseBodyChunk processes each subsequent chunk individually,
+//   using ctx.Metadata to track the cumulative byte count for max enforcement.
+//
+// invert enforcement:
+//   NeedsMoreResponseData buffers until the byte count exceeds max (guaranteed
+//   outside the excluded range). If [DONE] arrives while still gated, the full
+//   accumulated content is validated in OnResponseBodyChunk.
+
+// NeedsMoreResponseData implements StreamingResponsePolicy.
+// Buffers until the gate condition is satisfied — no bytes sent to the client
+// during accumulation. Always flushes when [DONE] arrives.
+func (p *ContentLengthGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return false
+	}
+	s := string(accumulated)
+	// Non-SSE: don't buffer — the buffered OnResponseBody handles it.
+	if !isSSEChunk(s) {
+		return false
+	}
+	// Stream is complete — flush for final validation.
+	if strings.Contains(s, sseDataPrefix+sseDone) {
+		return false
+	}
+	byteCount := len([]byte(extractSSEDeltaContent(s, p.responseParams.StreamingJsonPath)))
+	rp := p.responseParams
+	if rp.Invert {
+		// Invert mode: buffer while still within or below the excluded range.
+		return byteCount <= rp.Max
+	}
+	// Normal mode: buffer while below the required minimum.
+	return rp.Min > 0 && byteCount < rp.Min
+}
+
+// OnResponseBodyChunk implements StreamingResponsePolicy.
+// Maintains a running delta.content byte count across chunks and validates
+// the content length against the configured min/max thresholds.
+func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx *policyv1alpha2.ResponseStreamContext, chunk *policyv1alpha2.StreamBody, params map[string]interface{}) policyv1alpha2.ResponseChunkAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+	if chunk == nil || len(chunk.Chunk) == 0 {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	chunkStr := string(chunk.Chunk)
+	if !isSSEChunk(chunkStr) {
+		// Plain JSON via chunked transfer (e.g. OpenAI stream:false with Transfer-Encoding: chunked).
+		// Accumulate all chunks and validate the complete body at end of stream.
+		prev, _ := ctx.Metadata[metaKeyAccJsonBody].(string)
+		full := prev + chunkStr
+		ctx.Metadata[metaKeyAccJsonBody] = full
+		if !chunk.EndOfStream {
+			return policyv1alpha2.ResponseChunkAction{}
+		}
+		result := p.validatePayloadV2([]byte(full), p.responseParams, true)
+		if mod, ok := result.(policyv1alpha2.DownstreamResponseModifications); ok && mod.StatusCode != nil {
+			return policyv1alpha2.ResponseChunkAction{Body: mod.Body}
+		}
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	rp := p.responseParams
+
+	// Add this chunk's delta.content bytes to the running total stored in metadata.
+	// Metadata persists across OnResponseBodyChunk invocations for the same request.
+	prev := 0
+	if v, ok := ctx.Metadata[metaKeyResponseRunningBytes]; ok {
+		if n, ok := v.(int); ok {
+			prev = n
+		}
+	}
+	chunkContent := extractSSEDeltaContent(chunkStr, rp.StreamingJsonPath)
+	running := prev + len([]byte(chunkContent))
+	ctx.Metadata[metaKeyResponseRunningBytes] = running
+
+	isDone := chunk.EndOfStream
+
+	// Max violation: terminate early in normal mode at any point.
+	// Invert mode is excluded — it requires the full length at [DONE] to decide.
+	if rp.Max > 0 && !rp.Invert && running > rp.Max {
+		reason := fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", running, rp.Min, rp.Max)
+		slog.Debug("ContentLengthGuardrail: streaming max violation",
+			"runningBytes", running, "max", rp.Max)
+		return policyv1alpha2.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max)}
+	}
+
+	// At end of stream: perform the complete min/max/invert validation.
+	if isDone {
+		inRange := running >= rp.Min && (rp.Max == 0 || running <= rp.Max)
+		passed := inRange
+		if rp.Invert {
+			passed = !inRange
+		}
+		if !passed {
+			var reason string
+			if rp.Invert {
+				reason = fmt.Sprintf("content length %d bytes is within the excluded range %d-%d bytes", running, rp.Min, rp.Max)
+			} else {
+				reason = fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", running, rp.Min, rp.Max)
+			}
+			slog.Debug("ContentLengthGuardrail: streaming validation failed",
+				"runningBytes", running, "min", rp.Min, "max", rp.Max, "invert", rp.Invert)
+			return policyv1alpha2.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max)}
+		}
+	}
+
+	return policyv1alpha2.ResponseChunkAction{}
+}
+
+// isSSEChunk reports whether s contains at least one "data: " SSE line.
+func isSSEChunk(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractStringFromJSONPath(payload []byte, jsonPath string) (string, error) {
+	value, err := utils.ExtractStringValueFromJsonpath(payload, jsonPath)
+	if err == nil {
+		return value, nil
+	}
+
+	var jsonData map[string]interface{}
+	if unmarshalErr := json.Unmarshal(payload, &jsonData); unmarshalErr != nil {
+		return "", unmarshalErr
+	}
+
+	extracted, extractErr := utils.ExtractValueFromJsonpath(jsonData, jsonPath)
+	if extractErr != nil {
+		return "", extractErr
+	}
+
+	normalized, normalizeErr := normalizeExtractedValue(extracted)
+	if normalizeErr != nil {
+		return "", normalizeErr
+	}
+
+	return normalized, nil
+}
+
+func normalizeExtractedValue(value interface{}) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	case int:
+		return strconv.Itoa(v), nil
+	case bool:
+		return strconv.FormatBool(v), nil
+	case map[string]interface{}:
+		if content, ok := v["content"]; ok {
+			return normalizeExtractedValue(content)
+		}
+		if text, ok := v["text"]; ok {
+			return normalizeExtractedValue(text)
+		}
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
+	case []interface{}:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			part, itemErr := normalizeExtractedValue(item)
+			if itemErr != nil {
+				continue
+			}
+			part = strings.TrimSpace(part)
+			if part != "" {
+				parts = append(parts, part)
+			}
+		}
+		if len(parts) == 0 {
+			return "", fmt.Errorf("value at JSONPath is an empty array")
+		}
+		return strings.Join(parts, " "), nil
+	default:
+		return "", fmt.Errorf("value at JSONPath is not a supported type")
+	}
+}
+
+// extractSSEDeltaContent extracts and concatenates content values from every
+// complete SSE data line in s using the provided streamingJsonPath.
+// Returns "" for non-SSE or empty content.
+func extractSSEDeltaContent(s string, streamingJsonPath string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		if text, err := utils.ExtractStringValueFromJsonpath([]byte(jsonStr), streamingJsonPath); err == nil {
+			sb.WriteString(text)
+			continue
+		}
+		var jsonData map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &jsonData); err != nil {
+			continue
+		}
+		val, err := utils.ExtractValueFromJsonpath(jsonData, streamingJsonPath)
+		if err != nil {
+			continue
+		}
+		sb.WriteString(joinSSEFragments(val))
+	}
+	return sb.String()
+}
+
+// joinSSEFragments converts an extracted JSONPath value to a string.
+// Array elements are concatenated without a separator because SSE delta
+// fragments must be joined as-is without artificial whitespace.
+func joinSSEFragments(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var sb strings.Builder
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				sb.WriteString(s)
+			}
+		}
+		return sb.String()
+	default:
+		return ""
+	}
+}
+
+// buildSSEErrorEvent formats a guardrail violation as a single SSE data event
+// that replaces the offending chunk. ImmediateResponse is unavailable once
+// response headers are committed to the downstream client.
+func (p *ContentLengthGuardrailPolicy) buildSSEErrorEvent(reason string, showAssessment bool, min, max int) []byte {
+	assessment := p.buildAssessmentObject(reason, nil, true, showAssessment, min, max)
+	responseBody := map[string]interface{}{
+		"type":    "CONTENT_LENGTH_GUARDRAIL",
+		"message": assessment,
+	}
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"CONTENT_LENGTH_GUARDRAIL","message":"Internal error"}`)
+	}
+	return []byte(sseDataPrefix + string(bodyBytes) + "\n\n")
+}
+
+// buildErrorResponseV2 builds a policyv1alpha2 error response for both request and response phases.
+func (p *ContentLengthGuardrailPolicy) buildErrorResponseV2(reason string, validationError error, isResponse bool, showAssessment bool, min, max int) interface{} {
+	assessment := p.buildAssessmentObject(reason, validationError, isResponse, showAssessment, min, max)
+
+	responseBody := map[string]interface{}{
+		"type":    "CONTENT_LENGTH_GUARDRAIL",
+		"message": assessment,
+	}
+
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"CONTENT_LENGTH_GUARDRAIL","message":"Internal error"}`)
+	}
+
+	if isResponse {
+		statusCode := GuardrailErrorCode
+		return policyv1alpha2.DownstreamResponseModifications{
+			StatusCode: &statusCode,
+			Body:       bodyBytes,
+			DownstreamResponseHeaderModifications: policyv1alpha2.DownstreamResponseHeaderModifications{
+				HeadersToSet: map[string]string{"Content-Type": "application/json"},
+			},
+		}
+	}
+
+	return policyv1alpha2.ImmediateResponse{
+		StatusCode: GuardrailErrorCode,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       bodyBytes,
+	}
 }
