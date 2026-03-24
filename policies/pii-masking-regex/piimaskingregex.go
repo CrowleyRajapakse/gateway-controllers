@@ -18,12 +18,15 @@
 package piimaskingregex
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	utils "github.com/wso2/api-platform/sdk/utils"
 )
@@ -40,6 +43,10 @@ const (
 	DefaultEmailRegex         = `(?i)\b[a-z0-9.!#$%&'*+/=?^_{|}~-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])\b`
 	DefaultPhoneRegex         = `(?:\+?1[-.\s]?)?(?:\([2-9][0-9]{2}\)|[2-9][0-9]{2})[-.\s]?[2-9][0-9]{2}[-.\s]?[0-9]{4}\b`
 	DefaultSSNRegex           = `(?:00[1-9]|0[1-9][0-9]|[1-5][0-9]{2}|6(?:[0-57-9][0-9]|6[0-57-9])|[7-8][0-9]{2})[- ]?(?:0[1-9]|[1-9][0-9])[- ]?(?:000[1-9]|00[1-9][0-9]|0[1-9][0-9]{2}|[1-9][0-9]{3})\b`
+
+	// SSE constants for streaming responses
+	sseDataPrefix = "data: "
+	sseDone       = "[DONE]"
 )
 
 var textCleanRegexCompiled = regexp.MustCompile(TextCleanRegex)
@@ -423,6 +430,574 @@ func (p *PIIMaskingRegexPolicy) buildErrorResponse(reason string) interface{} {
 
 	// For PII masking, errors typically occur in request phase, but return as ImmediateResponse
 	return policy.ImmediateResponse{
+		StatusCode: APIMInternalErrorCode,
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		Body: bodyBytes,
+	}
+}
+
+// OnRequestHeaders implements v2alpha.RequestHeaderPolicy.
+// PII masking operates on the body, so headers are passed through unchanged.
+func (p *PIIMaskingRegexPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) policyv1alpha2.RequestHeaderAction {
+	return policyv1alpha2.UpstreamRequestHeaderModifications{}
+}
+
+// OnResponseHeaders implements v2alpha.ResponseHeaderPolicy.
+// PII masking operates on the body, so headers are passed through unchanged.
+func (p *PIIMaskingRegexPolicy) OnResponseHeaders(ctx *policyv1alpha2.ResponseHeaderContext, params map[string]interface{}) policyv1alpha2.ResponseHeaderAction {
+	return policyv1alpha2.DownstreamResponseHeaderModifications{}
+}
+
+// OnRequestBody masks PII in the request body before forwarding to upstream.
+func (p *PIIMaskingRegexPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, _ map[string]interface{}) policyv1alpha2.RequestAction {
+	return p.processRequestBody(ctx, nil)
+}
+
+// processRequestBody masks PII in the request body before forwarding to upstream.
+// Placeholders (e.g. [EMAIL_0000]) or redaction markers (*****) replace
+// detected PII. Placeholder→original mappings are stored in shared metadata
+// so processResponseBody can restore them.
+func (p *PIIMaskingRegexPolicy) processRequestBody(ctx *policyv1alpha2.RequestContext, params map[string]interface{}) policyv1alpha2.RequestAction {
+	if len(p.params.PIIEntities) == 0 {
+		return policyv1alpha2.UpstreamRequestModifications{}
+	}
+
+	if ctx.Body == nil || ctx.Body.Content == nil {
+		return policyv1alpha2.UpstreamRequestModifications{}
+	}
+	payload := ctx.Body.Content
+
+	extractedValue, ok, err := extractStringFromPath(payload, p.params.JsonPath)
+	if err != nil {
+		return p.buildErrorResponseV2(fmt.Sprintf("error extracting value from JSONPath: %v", err)).(policyv1alpha2.RequestAction)
+	}
+	if !ok {
+		// Value at path is not a scalar (e.g. multimodal content array); skip masking.
+		return policyv1alpha2.UpstreamRequestModifications{}
+	}
+
+	extractedValue = textCleanRegexCompiled.ReplaceAllString(extractedValue, "")
+	extractedValue = strings.TrimSpace(extractedValue)
+
+	var modifiedContent string
+	if p.params.RedactPII {
+		modifiedContent = p.redactPIIFromContent(extractedValue, p.params.PIIEntities)
+	} else {
+		modifiedContent, err = p.maskPIIFromContent(extractedValue, p.params.PIIEntities, ctx.Metadata)
+		if err != nil {
+			return p.buildErrorResponseV2(fmt.Sprintf("error masking PII: %v", err)).(policyv1alpha2.RequestAction)
+		}
+	}
+
+	if modifiedContent != "" && modifiedContent != extractedValue {
+		modifiedPayload := p.updatePayloadWithMaskedContent(payload, extractedValue, modifiedContent, p.params.JsonPath)
+		return policyv1alpha2.UpstreamRequestModifications{
+			Body: modifiedPayload,
+		}
+	}
+
+	return policyv1alpha2.UpstreamRequestModifications{}
+}
+
+// OnResponseBody restores PII placeholders in a buffered response body.
+func (p *PIIMaskingRegexPolicy) OnResponseBody(ctx *policyv1alpha2.ResponseContext, _ map[string]interface{}) policyv1alpha2.ResponseAction {
+	return p.processResponseBody(ctx, nil)
+}
+
+// processResponseBody restores PII placeholders in a buffered response body.
+//
+// Two body formats are handled:
+//   - Plain JSON (non-streaming): choices[*].message.content
+//   - SSE-buffered (chunked transfer of streaming response that this chain could not
+//     process in streaming mode): multiple "data: {...}" lines, choices[*].delta.content.
+//     The same restoreSSEChunk logic used by OnResponseBodyChunk is reused here.
+func (p *PIIMaskingRegexPolicy) processResponseBody(ctx *policyv1alpha2.ResponseContext, params map[string]interface{}) policyv1alpha2.ResponseAction {
+	if p.params.RedactPII {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	maskedPII, exists := ctx.Metadata[MetadataKeyPIIEntities]
+	if !exists {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	maskedPIIMap, ok := maskedPII.(map[string]string)
+	if !ok || len(maskedPIIMap) == 0 {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	if ctx.ResponseBody == nil || ctx.ResponseBody.Content == nil {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	bodyStr := string(ctx.ResponseBody.Content)
+
+	if isSSEChunk(bodyStr) {
+		// SSE-buffered: reuse the streaming restoration logic.
+		action := p.restoreSSEChunk(bodyStr, maskedPIIMap)
+		if action.Body == nil {
+			return policyv1alpha2.DownstreamResponseModifications{}
+		}
+		return policyv1alpha2.DownstreamResponseModifications{Body: action.Body}
+	}
+
+	// Plain JSON buffered response: try OpenAI choices[*].message.content first,
+	// then fall back to raw placeholder replacement for generic JSON structures.
+	updatedJSON, changed := restoreInChoices(bodyStr, maskedPIIMap, "message")
+	if changed {
+		return policyv1alpha2.DownstreamResponseModifications{Body: []byte(updatedJSON)}
+	}
+
+	// Fallback: restore placeholders directly in the raw JSON bytes.
+	action := p.restoreJSONChunk(bodyStr, maskedPIIMap)
+	if action.Body != nil {
+		return policyv1alpha2.DownstreamResponseModifications{Body: action.Body}
+	}
+	return policyv1alpha2.DownstreamResponseModifications{}
+}
+
+// NeedsMoreResponseData implements v2alpha.StreamingResponsePolicy.
+// Returns true when the accumulated SSE delta.content ends with what looks like
+// a partial PII placeholder ([ENTITY_XXXX]), so the kernel keeps buffering until
+// the complete token arrives.
+//
+// For non-SSE (plain JSON) responses delivered via chunked transfer encoding,
+// accumulates until the full JSON body is complete and parseable.
+func (p *PIIMaskingRegexPolicy) NeedsMoreResponseData(accumulated []byte) bool {
+	if p.params.RedactPII {
+		return false // no placeholders in redact mode
+	}
+
+	s := string(accumulated)
+
+	// For non-SSE (plain JSON) responses delivered via chunked transfer encoding,
+	// accumulate until the full JSON body is complete and parseable.
+	if !isSSEChunk(s) {
+		return !json.Valid(bytes.TrimSpace(accumulated))
+	}
+
+	// Extract concatenated delta.content from all complete SSE lines, tracking
+	// which data-line index contained the last '[' for the 5-token cap.
+	content, openBracketDataLineIdx, totalDataLines := extractSSEDeltaContentTracked(s)
+	if content == "" {
+		return false
+	}
+
+	lastOpen := strings.LastIndex(content, "[")
+	if lastOpen == -1 {
+		return false
+	}
+
+	afterBracket := content[lastOpen+1:]
+
+	if strings.Contains(afterBracket, "]") {
+		return false
+	}
+
+	if !isPartialPlaceholder(afterBracket) {
+		return false
+	}
+
+	// Hard cap: if more than 5 SSE data lines have arrived since the '[' was seen,
+	// give up waiting to avoid indefinite accumulation.
+	dataLinesAfterOpen := totalDataLines - openBracketDataLineIdx - 1
+	if dataLinesAfterOpen > 5 {
+		return false
+	}
+
+	return true
+}
+
+// OnResponseBodyChunk implements v2alpha.StreamingResponsePolicy.
+// Restores masked PII in response chunks.
+//
+// LLMs always use Transfer-Encoding: chunked, so this method handles two formats:
+//   - SSE streaming: lines prefixed with "data: ", restores in choices[*].delta.content
+//   - Full JSON (non-streaming, chunked transfer): restores in raw JSON bytes
+func (p *PIIMaskingRegexPolicy) OnResponseBodyChunk(ctx *policyv1alpha2.ResponseStreamContext, chunk *policyv1alpha2.StreamBody, params map[string]interface{}) policyv1alpha2.ResponseChunkAction {
+	if p.params.RedactPII {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+	if chunk == nil || len(chunk.Chunk) == 0 {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	maskedPII, exists := ctx.Metadata[MetadataKeyPIIEntities]
+	if !exists {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+	maskedPIIMap, ok := maskedPII.(map[string]string)
+	if !ok || len(maskedPIIMap) == 0 {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	chunkStr := string(chunk.Chunk)
+
+	// Detect format: SSE responses have lines starting with "data: "
+	if isSSEChunk(chunkStr) {
+		v1result := p.restoreSSEChunk(chunkStr, maskedPIIMap)
+		return policyv1alpha2.ResponseChunkAction{Body: v1result.Body}
+	}
+	v1result := p.restoreJSONChunk(chunkStr, maskedPIIMap)
+	return policyv1alpha2.ResponseChunkAction{Body: v1result.Body}
+}
+
+// ─── SSE / Streaming helpers ─────────────────────────────────────────────────
+
+// isSSEChunk reports whether the chunk looks like SSE data (has at least one "data: " line).
+func isSSEChunk(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreSSEChunk handles SSE streaming format: "data: {...}\n\n" lines.
+//
+// When the accumulator flushes a batch of SSE events (e.g. the placeholder
+// [EMAIL_0000] split across " [", "EMAIL", "_", "0000", "]" in separate events),
+// no single event contains the full placeholder. We therefore concatenate all
+// delta.content values, restore on the full string, then redistribute: the
+// first content-bearing event gets the complete restored text, and all subsequent
+// events whose content has been merged into the first are dropped entirely.
+func (p *PIIMaskingRegexPolicy) restoreSSEChunk(chunkStr string, maskedMap map[string]string) policyv1alpha2.ResponseChunkAction {
+	lines := strings.Split(chunkStr, "\n")
+
+	// Collect every SSE data line that carries a non-empty delta.content.
+	type contentLine struct {
+		lineIdx int
+		content string
+	}
+	var contentLines []contentLine
+	for i, line := range lines {
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		if c := extractFirstDeltaContent(jsonStr); c != "" {
+			contentLines = append(contentLines, contentLine{lineIdx: i, content: c})
+		}
+	}
+
+	if len(contentLines) == 0 {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	// Concatenate fragments and restore in one pass.
+	var sb strings.Builder
+	for _, cl := range contentLines {
+		sb.WriteString(cl.content)
+	}
+	fullContent := sb.String()
+	restoredContent := restore(fullContent, maskedMap)
+
+	if restoredContent == fullContent {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	// Redistribute: first content-bearing event gets the full restored text;
+	// subsequent events are dropped entirely.
+	lines[contentLines[0].lineIdx] = replaceContentInSSELine(
+		lines[contentLines[0].lineIdx], contentLines[0].content, restoredContent,
+	)
+	removeLines := make(map[int]bool, len(contentLines)-1)
+	for _, cl := range contentLines[1:] {
+		removeLines[cl.lineIdx] = true
+	}
+
+	filtered := lines[:0:0]
+	for i, line := range lines {
+		if removeLines[i] {
+			// Also drop the blank separator line immediately after, if present.
+			if i+1 < len(lines) && lines[i+1] == "" {
+				removeLines[i+1] = true
+			}
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+
+	return policyv1alpha2.ResponseChunkAction{Body: []byte(strings.Join(filtered, "\n"))}
+}
+
+// extractFirstDeltaContent parses a single SSE JSON line and returns the
+// delta.content value from the first choice, or empty string if absent/empty.
+func extractFirstDeltaContent(jsonStr string) string {
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return ""
+	}
+	choices, _ := data["choices"].([]interface{})
+	for _, cr := range choices {
+		choice, _ := cr.(map[string]interface{})
+		delta, _ := choice["delta"].(map[string]interface{})
+		if content, _ := delta["content"].(string); content != "" {
+			return content
+		}
+	}
+	return ""
+}
+
+// replaceContentInSSELine replaces the delta.content value in a "data: {...}" SSE
+// line in-place, touching only the JSON-encoded content value and leaving all
+// other fields intact. Falls back to a full re-marshal if the in-place
+// replacement cannot locate the expected token.
+func replaceContentInSSELine(line, oldContent, newContent string) string {
+	jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+	oldJSON, err1 := json.Marshal(oldContent)
+	newJSON, err2 := json.Marshal(newContent)
+	if err1 != nil || err2 != nil {
+		return updateDeltaContentInLine(line, newContent)
+	}
+	updated := strings.Replace(jsonStr, `"content":`+string(oldJSON), `"content":`+string(newJSON), 1)
+	if updated == jsonStr {
+		// Token not found (e.g. whitespace around colon) — fall back.
+		return updateDeltaContentInLine(line, newContent)
+	}
+	return sseDataPrefix + updated
+}
+
+// updateDeltaContentInLine is the fallback full-remarshal path used when
+// replaceContentInSSELine cannot locate the content token in the raw JSON.
+func updateDeltaContentInLine(line, newContent string) string {
+	jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return line
+	}
+	choices, _ := data["choices"].([]interface{})
+	updated := false
+	for _, cr := range choices {
+		choice, _ := cr.(map[string]interface{})
+		delta, ok := choice["delta"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, hasContent := delta["content"]; hasContent {
+			delta["content"] = newContent
+			updated = true
+		}
+	}
+	if !updated {
+		return line
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		return line
+	}
+	return sseDataPrefix + string(b)
+}
+
+// restoreJSONChunk handles full JSON responses delivered via chunked transfer encoding.
+// Placeholders are replaced directly in the raw JSON bytes so that key order,
+// whitespace, and any trailing newline from the LLM are preserved exactly.
+func (p *PIIMaskingRegexPolicy) restoreJSONChunk(chunkStr string, maskedMap map[string]string) policyv1alpha2.ResponseChunkAction {
+	result := chunkStr
+	for placeholder, original := range maskedMap {
+		if !strings.Contains(result, placeholder) {
+			continue
+		}
+		// JSON-encode the replacement so special characters (", \, etc.) are
+		// properly escaped. Strip the surrounding quotes that json.Marshal adds.
+		encodedBytes, err := json.Marshal(original)
+		if err != nil {
+			continue
+		}
+		escapedOriginal := string(encodedBytes[1 : len(encodedBytes)-1])
+		result = strings.ReplaceAll(result, placeholder, escapedOriginal)
+	}
+	if result == chunkStr {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+	return policyv1alpha2.ResponseChunkAction{Body: []byte(result)}
+}
+
+// restoreInChoices parses a JSON string, restores PII placeholders in
+// choices[*].<choiceKey>.content, and returns the updated JSON.
+// choiceKey is "message" for non-streaming or "delta" for streaming.
+func restoreInChoices(jsonStr string, maskedMap map[string]string, choiceKey string) (string, bool) {
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return jsonStr, false
+	}
+
+	choicesRaw, ok := data["choices"]
+	if !ok {
+		return jsonStr, false
+	}
+	choices, ok := choicesRaw.([]interface{})
+	if !ok || len(choices) == 0 {
+		return jsonStr, false
+	}
+
+	modified := false
+	for _, choiceRaw := range choices {
+		choice, ok := choiceRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		subRaw, ok := choice[choiceKey]
+		if !ok {
+			continue
+		}
+		sub, ok := subRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		content, ok := sub["content"].(string)
+		if !ok || content == "" {
+			continue
+		}
+		restored := restore(content, maskedMap)
+		if restored != content {
+			sub["content"] = restored
+			modified = true
+		}
+	}
+
+	if !modified {
+		return jsonStr, false
+	}
+
+	updatedBytes, err := json.Marshal(data)
+	if err != nil {
+		return jsonStr, false
+	}
+	return string(updatedBytes), true
+}
+
+// extractSSEDeltaContentTracked concatenates choices[*].delta.content from all
+// complete SSE data lines in the accumulated buffer. It returns:
+//   - the concatenated content string
+//   - the 0-based data-line index of the last line that contributed a '[' character
+//   - the total number of complete SSE data lines processed
+// TODO (Set Jsonstreaming path)
+func extractSSEDeltaContentTracked(s string) (string, int, int) {
+	var sb strings.Builder
+	totalDataLines := 0
+	lastOpenBracketDataLine := 0
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			totalDataLines++
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue // incomplete / partial line — skip
+		}
+		lineContent := ""
+		choices, _ := data["choices"].([]interface{})
+		for _, cr := range choices {
+			choice, _ := cr.(map[string]interface{})
+			delta, _ := choice["delta"].(map[string]interface{})
+			content, _ := delta["content"].(string)
+			lineContent += content
+		}
+		if strings.Contains(lineContent, "[") {
+			lastOpenBracketDataLine = totalDataLines
+		}
+		sb.WriteString(lineContent)
+		totalDataLines++
+	}
+	return sb.String(), lastOpenBracketDataLine, totalDataLines
+}
+
+// isPartialPlaceholder returns true when afterBracket (the text after '[') looks like
+// an incomplete placeholder that needs more chunks before processing.
+//
+// Placeholder format: [ENTITY_NAME_XXXX] where XXXX is exactly 4 hex digits.
+func isPartialPlaceholder(afterBracket string) bool {
+	if len(afterBracket) == 0 {
+		// Bare '[' at end of stream — could be start of placeholder, hold one more chunk.
+		return true
+	}
+	if afterBracket[0] < 'A' || afterBracket[0] > 'Z' {
+		return false // entity names always start with uppercase
+	}
+	for _, c := range afterBracket {
+		switch {
+		case c >= 'A' && c <= 'Z': // entity name chars
+		case c == '_': // entity name separator
+		case c >= '0' && c <= '9': // hex counter digits
+		case c >= 'a' && c <= 'f': // hex counter digits
+		default:
+			return false // any other char means it's not our placeholder
+		}
+	}
+	if len(afterBracket) > 30 {
+		return false // sanity guard: too long to be a valid placeholder
+	}
+	// Find the counter digits after the last underscore.
+	lastUnderscore := strings.LastIndex(afterBracket, "_")
+	if lastUnderscore < 0 {
+		return true // still building entity name, no underscore yet
+	}
+	return len(afterBracket)-lastUnderscore-1 <= 4 // true = counter incomplete or ']' not yet seen
+}
+
+// restore replaces placeholders with their original values.
+// maskedMap is placeholder → original.
+func restore(content string, maskedMap map[string]string) string {
+	result := content
+	for placeholder, original := range maskedMap {
+		result = strings.ReplaceAll(result, placeholder, original)
+	}
+	return result
+}
+
+// extractStringFromPath extracts the value at jsonPath from payload as a string.
+// Returns (value, true, nil) when the value is a scalar string or number.
+// Returns ("", false, nil) when the value exists but is not a scalar (e.g. array/object).
+// Returns ("", false, err) on path or parse errors.
+func extractStringFromPath(payload []byte, jsonPath string) (string, bool, error) {
+	if jsonPath == "" {
+		return string(payload), true, nil
+	}
+	var jsonData map[string]interface{}
+	if err := json.Unmarshal(payload, &jsonData); err != nil {
+		return "", false, err
+	}
+	raw, err := utils.ExtractValueFromJsonpath(jsonData, jsonPath)
+	if err != nil {
+		return "", false, err
+	}
+	switch v := raw.(type) {
+	case string:
+		return v, true, nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), true, nil
+	case int:
+		return strconv.Itoa(v), true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+func (p *PIIMaskingRegexPolicy) buildErrorResponseV2(reason string) interface{} {
+	responseBody := map[string]interface{}{
+		"code":    APIMInternalExceptionCode,
+		"message": "Error occurred during pii-masking-regex mediation: " + reason,
+	}
+
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(fmt.Sprintf(`{"code":%d,"type":"PII_MASKING_REGEX","message":"Internal error"}`, APIMInternalExceptionCode))
+	}
+
+	// For PII masking, errors typically occur in request phase, but return as ImmediateResponse
+	return policyv1alpha2.ImmediateResponse{
 		StatusCode: APIMInternalErrorCode,
 		Headers: map[string]string{
 			"Content-Type": "application/json",
