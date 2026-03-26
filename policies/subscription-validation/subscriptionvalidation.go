@@ -183,13 +183,32 @@ func (p *SubscriptionValidationPolicy) OnRequest(ctx *policy.RequestContext, par
 		if len(headerValues) > 0 {
 			token := strings.TrimSpace(headerValues[0])
 			if token != "" {
-				return p.validateByToken(apiID, token)
+				if action := p.validateByToken(apiID, token); action != nil {
+					return action
+				}
+				return policy.UpstreamRequestModifications{
+					RemoveHeaders: []string{normalizeHeaderName(p.cfg.SubscriptionKeyHeader)},
+				}
 			}
 		}
 		// Path 1b: Check subscription key cookie if configured
 		if p.cfg.SubscriptionKeyCookie != "" {
 			if token := getCookieValue(ctx.Headers, p.cfg.SubscriptionKeyCookie); token != "" {
-				return p.validateByToken(apiID, token)
+				if action := p.validateByToken(apiID, token); action != nil {
+					return action
+				}
+
+				cookieValues := ctx.Headers.Get("Cookie")
+				updated, removed := stripCookie(cookieValues, p.cfg.SubscriptionKeyCookie)
+				if removed {
+					if updated == "" {
+						return policy.UpstreamRequestModifications{RemoveHeaders: []string{"cookie"}}
+					}
+					return policy.UpstreamRequestModifications{SetHeaders: map[string]string{"cookie": updated}}
+				}
+
+				// Token came from cookie lookup, but we couldn't safely strip it; fail open on stripping only.
+				return policy.UpstreamRequestModifications{}
 			}
 		}
 	}
@@ -398,6 +417,46 @@ func entryThrottleUnitString(window time.Duration) string {
 	}
 }
 
+func normalizeHeaderName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// stripCookie removes the cookie with the given name from Cookie header values.
+// It returns the updated Cookie header (single header value) and whether a removal occurred.
+func stripCookie(cookieHeaderValues []string, cookieName string) (string, bool) {
+	if cookieName == "" || len(cookieHeaderValues) == 0 {
+		return "", false
+	}
+
+	parts := make([]string, 0, 8)
+	removed := false
+
+	for _, raw := range cookieHeaderValues {
+		for _, part := range strings.Split(raw, ";") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			idx := strings.Index(part, "=")
+			if idx < 0 {
+				parts = append(parts, part)
+				continue
+			}
+			name := strings.TrimSpace(part[:idx])
+			if strings.EqualFold(name, cookieName) {
+				removed = true
+				continue
+			}
+			parts = append(parts, part)
+		}
+	}
+
+	if !removed {
+		return "", false
+	}
+	return strings.Join(parts, "; "), true
+}
+
 // OnRequestHeaders validates the subscription in the request header phase.
 func (p *SubscriptionValidationPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) policyv1alpha2.RequestHeaderAction {
 	if ctx == nil || ctx.SharedContext == nil {
@@ -422,7 +481,9 @@ func (p *SubscriptionValidationPolicy) OnRequestHeaders(ctx *policyv1alpha2.Requ
 			if token != "" {
 				result := p.validateByTokenV2(apiID, token)
 				if result == nil {
-					return policyv1alpha2.UpstreamRequestHeaderModifications{}
+					return policyv1alpha2.UpstreamRequestHeaderModifications{
+						HeadersToRemove: []string{normalizeHeaderName(p.cfg.SubscriptionKeyHeader)},
+					}
 				}
 				return result.(policyv1alpha2.ImmediateResponse)
 			}
@@ -431,6 +492,18 @@ func (p *SubscriptionValidationPolicy) OnRequestHeaders(ctx *policyv1alpha2.Requ
 			if token := getCookieValueV2(ctx.Headers, p.cfg.SubscriptionKeyCookie); token != "" {
 				result := p.validateByTokenV2(apiID, token)
 				if result == nil {
+					cookieValues := ctx.Headers.Get("Cookie")
+					updated, removed := stripCookie(cookieValues, p.cfg.SubscriptionKeyCookie)
+					if removed {
+						if updated == "" {
+							return policyv1alpha2.UpstreamRequestHeaderModifications{
+								HeadersToRemove: []string{"cookie"},
+							}
+						}
+						return policyv1alpha2.UpstreamRequestHeaderModifications{
+							HeadersToSet: map[string]string{"cookie": updated},
+						}
+					}
 					return policyv1alpha2.UpstreamRequestHeaderModifications{}
 				}
 				return result.(policyv1alpha2.ImmediateResponse)

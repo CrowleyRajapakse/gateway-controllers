@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"testing"
+	"strings"
 
 	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policyenginev1 "github.com/wso2/api-platform/sdk/gateway/policyengine/v1"
@@ -76,6 +77,46 @@ func assertSuccess(t *testing.T, action policyv1alpha2.RequestHeaderAction) {
 	t.Helper()
 	if _, ok := action.(policyv1alpha2.UpstreamRequestHeaderModifications); !ok {
 		t.Fatalf("expected UpstreamRequestHeaderModifications (allow), got %#v", action)
+	}
+}
+
+func assertHeaderRemoved(t *testing.T, action policyv1alpha2.RequestHeaderAction, header string) {
+	t.Helper()
+	mod, ok := action.(policyv1alpha2.UpstreamRequestHeaderModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestHeaderModifications, got %#v", action)
+	}
+	header = strings.ToLower(strings.TrimSpace(header))
+	for _, h := range mod.HeadersToRemove {
+		if strings.ToLower(strings.TrimSpace(h)) == header {
+			return
+		}
+	}
+	t.Fatalf("expected header %q to be removed; got HeadersToRemove=%v", header, mod.HeadersToRemove)
+}
+
+func assertCookieStripped(t *testing.T, action policyv1alpha2.RequestHeaderAction, cookieName string) {
+	t.Helper()
+	mod, ok := action.(policyv1alpha2.UpstreamRequestHeaderModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestHeaderModifications, got %#v", action)
+	}
+	// Either Cookie is fully removed...
+	for _, h := range mod.HeadersToRemove {
+		if strings.EqualFold(strings.TrimSpace(h), "cookie") {
+			return
+		}
+	}
+	// ...or rewritten without the cookieName.
+	cookieHeader, ok := mod.HeadersToSet["cookie"]
+	if !ok {
+		cookieHeader, ok = mod.HeadersToSet["Cookie"]
+	}
+	if !ok {
+		t.Fatalf("expected cookie to be removed or rewritten; got HeadersToRemove=%v HeadersToSet=%v", mod.HeadersToRemove, mod.HeadersToSet)
+	}
+	if strings.Contains(strings.ToLower(cookieHeader), strings.ToLower(cookieName)+"=") {
+		t.Fatalf("expected cookie %q to be stripped; got Cookie header %q", cookieName, cookieHeader)
 	}
 }
 
@@ -190,7 +231,9 @@ func TestOnRequestHeaders_AllowsValidToken(t *testing.T) {
 	})
 	p := newPolicy(defaultCfg(), store)
 	ctx := headerCtxWithToken("api-1", "tok-1", "")
-	assertSuccess(t, p.OnRequestHeaders(ctx, nil))
+	action := p.OnRequestHeaders(ctx, nil)
+	assertSuccess(t, action)
+	assertHeaderRemoved(t, action, defaultSubscriptionKeyHeader)
 }
 
 func TestOnRequestHeaders_DeniesInvalidToken(t *testing.T) {
@@ -220,7 +263,9 @@ func TestOnRequestHeaders_CustomHeaderName(t *testing.T) {
 	p := newPolicy(cfg, store)
 
 	ctx := headerCtxWithToken("api-1", "tok-1", "X-Custom-Sub")
-	assertSuccess(t, p.OnRequestHeaders(ctx, nil))
+	action := p.OnRequestHeaders(ctx, nil)
+	assertSuccess(t, action)
+	assertHeaderRemoved(t, action, "X-Custom-Sub")
 }
 
 // --- cookie path -------------------------------------------------------------
@@ -233,7 +278,9 @@ func TestOnRequestHeaders_AllowsValidTokenFromCookie(t *testing.T) {
 	cfg.SubscriptionKeyCookie = "sub-key"
 	p := newPolicy(cfg, store)
 	ctx := headerCtxWithCookie("api-1", "tok-1", "sub-key")
-	assertSuccess(t, p.OnRequestHeaders(ctx, nil))
+	action := p.OnRequestHeaders(ctx, nil)
+	assertSuccess(t, action)
+	assertCookieStripped(t, action, "sub-key")
 }
 
 func TestOnRequestHeaders_CookieDeniesInvalidToken(t *testing.T) {
@@ -265,7 +312,9 @@ func TestOnRequestHeaders_HeaderTakesPrecedenceOverCookie(t *testing.T) {
 		}),
 	}
 	// Header value should be used; tok-1 is valid
-	assertSuccess(t, p.OnRequestHeaders(ctx, nil))
+	action := p.OnRequestHeaders(ctx, nil)
+	assertSuccess(t, action)
+	assertHeaderRemoved(t, action, defaultSubscriptionKeyHeader)
 }
 
 func TestOnRequestHeaders_CookieUsedWhenHeaderMissing(t *testing.T) {
@@ -276,7 +325,9 @@ func TestOnRequestHeaders_CookieUsedWhenHeaderMissing(t *testing.T) {
 	cfg.SubscriptionKeyCookie = "sub-key"
 	p := newPolicy(cfg, store)
 	ctx := headerCtxWithCookie("api-1", "tok-1", "sub-key")
-	assertSuccess(t, p.OnRequestHeaders(ctx, nil))
+	action := p.OnRequestHeaders(ctx, nil)
+	assertSuccess(t, action)
+	assertCookieStripped(t, action, "sub-key")
 }
 
 func TestGetCookieValueV2(t *testing.T) {
@@ -370,7 +421,9 @@ func TestOnRequestHeaders_RateLimitEnforced(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		ctx := headerCtxWithToken("api-1", "tok-1", "")
-		assertSuccess(t, p.OnRequestHeaders(ctx, nil))
+		action := p.OnRequestHeaders(ctx, nil)
+		assertSuccess(t, action)
+		assertHeaderRemoved(t, action, defaultSubscriptionKeyHeader)
 	}
 
 	ctx := headerCtxWithToken("api-1", "tok-1", "")
