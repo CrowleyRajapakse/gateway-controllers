@@ -618,20 +618,14 @@ func ensureRequestMetadataV2(ctx *policyv1alpha2.RequestContext) {
 	}
 }
 
-// OnRequestBody processes the request body phase for MCP authentication.
-func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params map[string]any) policyv1alpha2.RequestAction {
+func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) policyv1alpha2.RequestHeaderAction {
 	if err := validateAuthFailureConfig(p.OnFailureStatusCode, p.ErrorMessageFormat); err != nil {
 		v1r := buildInvalidConfigResponseV2(err.Error()).(policyv1alpha2.ImmediateResponse)
 		return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
 	}
-
-	if p.GatewayHost != "" {
-		ensureRequestMetadataV2(ctx)
-		ctx.Metadata["gatewayHost"] = p.GatewayHost
-	}
-
 	// Check for GET /.well-known/oauth-protected-resource
-	if ctx.Method == "GET" && isWellKnownEndpointRequest(ctx.Path) {
+	if ctx.Method == "GET" && isWellKnownEndpointRequest(ctx.OperationPath) {
+		slog.Debug("MCP Auth Policy: Handling well-known protected resource metadata request")
 		sessionIds := ctx.Headers.Get(McpSessionHeader)
 		sessionId := ""
 		if len(sessionIds) > 0 {
@@ -640,9 +634,11 @@ func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params
 
 		keyManagersRaw, ok := params["keyManagers"]
 		if !ok {
+			slog.Debug("MCP Auth Policy: Key managers not configured in params")
 			return p.handleAuthFailureV2(ctx.SharedContext, p.OnFailureStatusCode, p.ErrorMessageFormat, "key managers not configured")
 		}
 
+		slog.Debug("MCP Auth Policy: Starting to parse key managers configuration")
 		issuers, kms, err := parseKeyManagers(keyManagersRaw)
 		if err != nil {
 			v1r := buildInvalidConfigResponseV2(err.Error()).(policyv1alpha2.ImmediateResponse)
@@ -657,6 +653,7 @@ func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params
 			for _, ui := range p.Issuers {
 				if issuer, ok := kms[ui]; ok {
 					filteredIssuers = append(filteredIssuers, issuer)
+					slog.Debug("MCP Auth Policy: Added issuer from user configuration", "issuer", issuer)
 				}
 			}
 			issuers = filteredIssuers
@@ -680,7 +677,23 @@ func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params
 			},
 			Body: jsonOut,
 		}
-	} else if ctx.Method == "POST" && strings.Contains(ctx.OperationPath, "mcp") {
+	}
+	return policyv1alpha2.UpstreamRequestHeaderModifications{}
+}
+
+// OnRequestBody processes the request body phase for MCP authentication.
+func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params map[string]any) policyv1alpha2.RequestAction {
+	if err := validateAuthFailureConfig(p.OnFailureStatusCode, p.ErrorMessageFormat); err != nil {
+		v1r := buildInvalidConfigResponseV2(err.Error()).(policyv1alpha2.ImmediateResponse)
+		return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
+	}
+
+	if p.GatewayHost != "" {
+		ensureRequestMetadataV2(ctx)
+		ctx.Metadata["gatewayHost"] = p.GatewayHost
+	}
+
+	if ctx.Method == "POST" && strings.Contains(ctx.OperationPath, "mcp") {
 		if ctx.Body == nil || !ctx.Body.Present {
 			return p.handleAuthV2(ctx, params, p.RequiredScopes)
 		}
@@ -703,7 +716,7 @@ func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params
 		return p.handleAuthV2(ctx, params, p.RequiredScopes)
 	}
 
-	return nil
+	return policyv1alpha2.UpstreamRequestModifications{}
 }
 
 // handleAuthFailureV2 constructs an authentication failure response.
